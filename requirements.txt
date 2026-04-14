@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+lxml
+textblob
+pillow
+streamlit
+geopy
+duckduckgo-search
+phonenumbers
+python-magic
