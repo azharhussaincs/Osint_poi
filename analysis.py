@@ -46,17 +46,25 @@ def connection_engine(api_results, osint_results):
                 name = res.get('NAME') or res.get('name')
                 email = res.get('EMAIL') or res.get('email')
                 phone = res.get('PHONE') or res.get('phone')
+                asondate = res.get('ASONDATE') or res.get('asondate') or res.get('AsonDate')
                 if name: graph['names'].add(name)
                 if email: graph['emails'].add(email)
                 if phone: graph['phones'].add(phone)
+                if asondate:
+                    if 'asondates' not in graph: graph['asondates'] = set()
+                    graph['asondates'].add(asondate)
         elif isinstance(results, dict):
             # Maybe it's not a list but a single result
             name = results.get('NAME') or results.get('name')
             email = results.get('EMAIL') or results.get('email')
             phone = results.get('PHONE') or results.get('phone')
+            asondate = results.get('ASONDATE') or results.get('asondate') or results.get('AsonDate')
             if name: graph['names'].add(name)
             if email: graph['emails'].add(email)
             if phone: graph['phones'].add(phone)
+            if asondate:
+                if 'asondates' not in graph: graph['asondates'] = set()
+                graph['asondates'].add(asondate)
 
     # Add OSINT data
     if osint_results:

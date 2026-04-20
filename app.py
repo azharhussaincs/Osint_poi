@@ -11,35 +11,31 @@ from bs4 import BeautifulSoup
 # from duckduckgo_search import DDGS  # Moved inside search_web to suppress rename warning
 import time
 
-# --- API CONFIGURATION ---
+    # --- API CONFIGURATION ---
 API_URL = "http://192.168.18.29:8080/api/tc-search"
 API_TOKEN = "9f2b1e3a7c4d5f6a8b0c1d2e3f4a5b6c"
 
+def validate_name(name):
+    """Validates that the name contains only alphabets, spaces, and common name characters."""
+    if not name:
+        return True
+    # Allow alphabets, spaces, dots, hyphens, and digits (some names include numbers).
+    # Block if it's purely digits.
+    if name.isdigit():
+        return False
+    import re
+    # Allow a-z, A-Z, 0-9, spaces, dots, and hyphens.
+    return bool(re.match(r'^[a-zA-Z0-9\s\.\-]+$', name))
+
+def validate_phone(phone):
+    """Validates that the phone number contains only digits."""
+    if not phone:
+        return True
+    # Remove common formatting and check if only digits remain
+    clean_phone = phone.replace(" ", "").replace("+", "").replace("-", "").replace("(", "").replace(")", "")
+    return clean_phone.isdigit()
+
 def call_truecaller_api(name="", phone="", email="", tag=""):
-    # --- Auto-Detect and Fix Swapped Inputs (Name/Phone/Email) ---
-    
-    # Check if name contains only digits (likely a phone number)
-    name_is_phone = name and name.isdigit() or (name and all(c.isdigit() or c in "+-() " for c in name) and any(c.isdigit() for c in name))
-    
-    # Check if phone contains letters (likely a name)
-    phone_is_name = phone and any(c.isalpha() for c in phone)
-    
-    # Swapping logic
-    if name_is_phone and not phone:
-        phone = name
-        name = ""
-    elif phone_is_name and not name:
-        name = phone
-        phone = ""
-    elif name_is_phone and phone_is_name:
-        # Both are swapped
-        name, phone = phone, name
-
-    # If name looks like an email, move it to email
-    if name and not email and "@" in name and "." in name:
-        email = name
-        name = ""
-
     # Clean phone number (keep only digits)
     if phone:
         phone = "".join(filter(str.isdigit, phone))
@@ -233,8 +229,27 @@ def main():
             st.warning("Please provide at least one input.")
             return
 
+        # --- Strict Input Validation ---
+        if name_input and not validate_name(name_input):
+            st.error("The Name field should only accept text (alphabets).")
+            return
+        
+        if phone_input and not validate_phone(phone_input):
+            st.error("The Phone Number field should only accept numeric values.")
+            return
+
+        # If searching by name, ensure phone is empty and vice versa (requirement 3)
+        if name_input and phone_input:
+            st.warning("Please search by either Name or Phone Number, not both at once.")
+            return
+        
+        # Requirement 3: If phone number is entered, search only by PHONE. 
+        # If name is entered, search only by NAME.
+        api_name = name_input if not phone_input else ""
+        api_phone = phone_input if not name_input else ""
+
         with st.spinner("Calling API..."):
-            api_results = call_truecaller_api(name=name_input, phone=phone_input, email=email_input)
+            api_results = call_truecaller_api(name=api_name, phone=api_phone, email=email_input)
         
         results_list = api_results.get("results", [])
         
@@ -249,36 +264,58 @@ def main():
             st.success(f"API returned {len(results_list)} results!")
             for i, r in enumerate(results_list):
                 with st.expander(f"👤 Result {i+1}: {r.get('NAME', 'Unknown')}"):
-                    name = r.get('NAME')
-                    phone = r.get('PHONE')
-                    email = r.get('EMAIL')
-                    st.write(f"**Name:** {name}")
-                    st.write(f"**Phone:** {phone}")
-                    st.write(f"**Email:** {email}")
-                    st.write(f"**Date:** {r.get('ASONDATE')}")
+                    name = r.get('NAME') or r.get('name')
+                    phone = r.get('PHONE') or r.get('phone')
+                    email = r.get('EMAIL') or r.get('email')
+                    tags = r.get('TAGS') or r.get('tags') or r.get('tag')
+                    
+                    st.write(f"**NAME:** {name}")
+                    st.write(f"**PHONE:** {phone}")
+                    st.write(f"**EMAIL:** {email}")
+                    if tags:
+                        st.write(f"**TAGS:** {tags}")
+                    else:
+                        st.write("**TAGS:** None")
+                        
+                    # Ensure ASONDATE is displayed - prioritize ASONDATE from API
+                    as_on_date = r.get('ASONDATE') or r.get('asondate') or r.get('AsonDate')
+                    if as_on_date:
+                        st.write(f"**ASONDATE:** {as_on_date}")
+                    else:
+                        # Try to find it in other possible keys just in case
+                        alt_date = r.get('date') or r.get('DATE') or r.get('as_on_date')
+                        if alt_date:
+                            st.write(f"**ASONDATE:** {alt_date}")
+                        else:
+                            st.write("**ASONDATE:** None")
                     
                     # Add API results to the lists for OSINT pipeline
                     if name: all_names.append(name)
                     if phone: all_phones.append(phone)
                     if email: all_emails.append(email)
             
-            # De-duplicate lists after adding API results
+    # De-duplicate lists after adding API results
             all_names = list(set(all_names))
             all_phones = list(set(all_phones))
             all_emails = list(set(all_emails))
 
             st.header("🕸️ Connection Engine")
-            st.json(analysis.connection_engine(api_results, {}))
+            # Update connection engine to include ASONDATE
+            connections = analysis.connection_engine(api_results, {})
+            st.json(connections)
             
             # If API results are found, show them and then proceed to OSINT pipeline for social media
             st.info("API data retrieved. Searching internet for related social media and additional details...")
+        else:
+            st.error("No corresponding data found")
         
         # OSINT pipeline - Always run if searched to find social media as requested
         if True:
             if not any([all_names, all_phones, all_emails]) and image_upload:
                 st.info("No text data found, proceeding with image OSINT...")
             elif not results_list:
-                st.info("API returned empty results. Triggering REAL OSINT pipeline...")
+                # Handled above with "No corresponding data found. from db"
+                st.info("Triggering REAL OSINT pipeline...")
             else:
                 st.info("Processing internet OSINT...")
             
