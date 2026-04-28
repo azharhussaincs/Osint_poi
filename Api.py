@@ -1,6 +1,6 @@
 import requests
 
-url = "http://192.168.18.29:8080/api/tc-search"
+url = "http://192.168.18.126:8080/api/tc-search"
 
 payload = {
     "token": "9f2b1e3a7c4d5f6a8b0c1d2e3f4a5b6c",

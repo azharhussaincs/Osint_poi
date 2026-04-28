@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 from PIL import Image
 from PIL.ExifTags import TAGS
+import re
 import social
 import analysis
 import crawler
@@ -12,7 +13,7 @@ from bs4 import BeautifulSoup
 import time
 
     # --- API CONFIGURATION ---
-API_URL = "http://192.168.18.29:8080/api/tc-search"
+API_URL = "http://192.168.18.126:8080/api/tc-search"
 API_TOKEN = "9f2b1e3a7c4d5f6a8b0c1d2e3f4a5b6c"
 
 def validate_name(name):
@@ -25,7 +26,7 @@ def validate_name(name):
         return False
     import re
     # Allow a-z, A-Z, 0-9, spaces, dots, and hyphens.
-    return bool(re.match(r'^[a-zA-Z0-9\s\.\-]+$', name))
+    return bool(re.match(r'^[a-zA-Z0-9\s.-]+$', name))
 
 def validate_phone(phone):
     """Validates that the phone number contains only digits."""
@@ -81,18 +82,20 @@ def search_bing(query):
     }
     url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        # Use a slightly more "real" browser header
+        headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Bing search results are often in <h2> tags with class 'b_algo'
-        for item in soup.select('.b_algo h2 a'):
+        # Bing search results can also be in 'li.b_algo'
+        for item in soup.select('.b_algo h2 a, .b_algo h3 a'):
             href = item.get('href')
-            if href and href.startswith("http"):
+            if href and href.startswith("http") and "bing.com" not in href:
                 results.append(href)
     except Exception as e:
         print(f"Bing search error for '{query}': {e}")
-    return results
+    return list(set(results))
 
 def search_web(query):
     """Takes a search query and returns real URLs from DuckDuckGo or Bing fallback"""
@@ -107,9 +110,9 @@ def search_web(query):
             warnings.simplefilter("ignore", category=RuntimeWarning)
             from duckduckgo_search import DDGS
             with DDGS() as ddgs:
-                # max_results=5 as per performance requirements
-                for r in ddgs.text(cleaned, max_results=5):
-                    # Ensure URL extraction is correct - check multiple keys
+                # Use a broader search if possible or just stick to text
+                search_results = list(ddgs.text(cleaned, max_results=10))
+                for r in search_results:
                     url = r.get('href') or r.get('url') or r.get('link')
                     if url:
                         results.append(url)
@@ -175,16 +178,28 @@ def get_image_metadata(image_file):
     try:
         img = Image.open(image_file)
         exif_data = img._getexif()
-        if not exif_data:
-            return "No metadata found."
-        
         metadata = {}
-        for tag, value in exif_data.items():
-            tag_name = TAGS.get(tag, tag)
-            metadata[tag_name] = value
+        
+        # Basic info
+        metadata["Format"] = img.format
+        metadata["Mode"] = img.mode
+        metadata["Size"] = img.size
+        metadata["Filename"] = getattr(image_file, 'name', 'Unknown')
+        
+        if exif_data:
+            for tag, value in exif_data.items():
+                tag_name = TAGS.get(tag, tag)
+                # Handle bytes values
+                if isinstance(value, bytes):
+                    try:
+                        value = value.decode(errors='ignore')
+                    except:
+                        value = str(value)
+                metadata[tag_name] = value
+        
         return metadata
     except Exception as e:
-        return f"Error extracting metadata: {e}"
+        return {"Error": f"Error extracting metadata: {e}"}
 
 def reverse_image_search_links(image_file):
     """Generates real reverse image search URLs."""
@@ -238,27 +253,114 @@ def main():
             st.error("The Phone Number field should only accept numeric values.")
             return
 
-        # If searching by name, ensure phone is empty and vice versa (requirement 3)
-        if name_input and phone_input:
-            st.warning("Please search by either Name or Phone Number, not both at once.")
-            return
-        
-        # Requirement 3: If phone number is entered, search only by PHONE. 
-        # If name is entered, search only by NAME.
-        api_name = name_input if not phone_input else ""
-        api_phone = phone_input if not name_input else ""
-
-        with st.spinner("Calling API..."):
-            api_results = call_truecaller_api(name=api_name, phone=api_phone, email=email_input)
-        
-        results_list = api_results.get("results", [])
-        
         # Prepare lists for OSINT pipeline
         # Use data from local file and user input as base
         all_names = [name_input] if name_input else []
         all_phones = [phone_input] if phone_input else []
         all_emails = [email_input] if email_input else []
 
+        osint_data = {
+            "emails": [],
+            "phones": [],
+            "names": [],
+            "social_links": {},
+            "images": [],
+            "source_urls": [],
+            "metadata": None,
+            "sentiment": "Neutral",
+            "location": "Unknown"
+        }
+
+        # 0. Image Metadata Extraction (Moved before API call to feed into it)
+        if image_upload:
+            with st.status("Analyzing uploaded image..."):
+                osint_data["metadata"] = get_image_metadata(image_upload)
+                osint_data["reverse_search_links"] = reverse_image_search_links(image_upload)
+                
+                if osint_data["metadata"] and isinstance(osint_data["metadata"], dict):
+                    # Try to find a name or info in metadata
+                    artist = osint_data["metadata"].get("Artist")
+                    author = osint_data["metadata"].get("Author")
+                    xp_author = osint_data["metadata"].get("XPAuthor")
+                    xp_comment = osint_data["metadata"].get("XPComment")
+                    image_desc = osint_data["metadata"].get("ImageDescription")
+                    user_comment = osint_data["metadata"].get("UserComment")
+                    
+                    if artist: all_names.append(artist)
+                    if author: all_names.append(author)
+                    if xp_author: all_names.append(xp_author)
+                    
+                    # Search for emails/phones in comments/descriptions
+                    for text_field in [xp_comment, image_desc, user_comment]:
+                        if text_field and isinstance(text_field, str):
+                            osint_data["emails"].extend(crawler.extract_emails(text_field))
+                            osint_data["phones"].extend(crawler.extract_phones(text_field))
+                            osint_data["names"].extend(crawler.extract_names(None, text_field))
+
+                    # If no name found yet but filename is descriptive (not IMG_123 or file)
+                    filename = osint_data["metadata"].get("Filename", "")
+                    if filename and not re.match(r"^(IMG_|DSC|P_|IMAGE|PHOTO|FILE|UPLOAD)\d*", filename, re.I):
+                        # Strip extension
+                        name_from_file = filename.rsplit('.', 1)[0]
+                        # Avoid generic names
+                        if len(name_from_file) > 3 and name_from_file.lower() not in ["image", "photo", "file", "upload", "pic"]:
+                            all_names.append(name_from_file)
+
+                # Ensure extracted data is added to search lists
+                all_names = list(set([n for n in all_names if n and len(n) > 2]))
+                all_emails = list(set(all_emails + osint_data["emails"]))
+                all_phones = list(set(all_phones + osint_data["phones"]))
+                image_upload.seek(0)
+
+        # If searching by name, ensure phone is empty and vice versa (requirement 3)
+        if name_input and phone_input:
+            st.warning("Searching by both Name and Phone Number may limit API results, but OSINT pipeline will use both.")
+        
+        # Requirement 3: If phone number is entered, search only by PHONE. 
+        # If name is entered, search only by NAME.
+        # NOW: If image provides a name and input is empty, use image name.
+        api_name = name_input
+        if not api_name and all_names:
+            api_name = all_names[0]
+            st.info(f"Using name from image: {api_name}")
+
+        api_phone = phone_input
+        if not api_phone and all_phones:
+            api_phone = all_phones[0]
+            st.info(f"Using phone from image: {api_phone}")
+
+        api_email = email_input
+        if not api_email and all_emails:
+            api_email = all_emails[0]
+            st.info(f"Using email from image: {api_email}")
+            
+        # Refined requirement 3 logic for API call
+        final_api_name = api_name if not api_phone else ""
+        final_api_phone = api_phone if not api_name else ""
+
+        # API call - Skip ONLY if no text input is provided and no data was extracted from the image
+        # User requested skipping when image is uploaded because "api did not have images details"
+        # but we should still call it if we have a name or phone to search for.
+        api_results = {"results": []}
+        
+        # Decide whether to call the API
+        # We call it if:
+        # 1. No image is uploaded (standard search)
+        # 2. Image is uploaded BUT we have a phone or name to search for (either from input or extracted)
+        should_call_api = False
+        if not image_upload:
+            should_call_api = True
+        elif final_api_name or final_api_phone or api_email:
+            should_call_api = True
+            
+        if should_call_api:
+            with st.spinner("Calling API..."):
+                api_results = call_truecaller_api(name=final_api_name, phone=final_api_phone, email=api_email)
+        else:
+            st.info("No text or phone data to search in primary API.")
+        
+        results_list = api_results.get("results", [])
+        
         # Display API results if found
         if results_list:
             st.success(f"API returned {len(results_list)} results!")
@@ -283,7 +385,7 @@ def main():
                         st.write(f"**ASONDATE:** {as_on_date}")
                     else:
                         # Try to find it in other possible keys just in case
-                        alt_date = r.get('date') or r.get('DATE') or r.get('as_on_date')
+                        alt_date = r.get('date') or r.get('DATE') or r.get('as_on_date') or r.get('AS_ON_DATE')
                         if alt_date:
                             st.write(f"**ASONDATE:** {alt_date}")
                         else:
@@ -294,8 +396,12 @@ def main():
                     if phone: all_phones.append(phone)
                     if email: all_emails.append(email)
             
-    # De-duplicate lists after adding API results
-            all_names = list(set(all_names))
+            if data_entities['names']: all_names.extend(data_entities['names'])
+            if data_entities['emails']: all_emails.extend(data_entities['emails'])
+            if data_entities['phones']: all_phones.extend(data_entities['phones'])
+
+            # De-duplicate lists after adding API and file results
+            all_names = list(set([n for n in all_names if n and len(n) > 2]))
             all_phones = list(set(all_phones))
             all_emails = list(set(all_emails))
 
@@ -319,19 +425,7 @@ def main():
             else:
                 st.info("Processing internet OSINT...")
             
-            osint_data = {
-                "emails": [],
-                "phones": [],
-                "names": [],
-                "social_links": {},
-                "images": [],
-                "source_urls": [],
-                "metadata": None,
-                "sentiment": "Neutral",
-                "location": "Unknown"
-            }
-
-    # 1. Dorking Engine
+            # 1. Dorking Engine
             # Use all collected data (including API results) for dorking
             dorks = []
             for n in all_names: 
@@ -425,21 +519,14 @@ def main():
                 if key not in osint_data["social_links"]:
                     osint_data["social_links"][key] = val
 
-            # 5. Image Search & Metadata
+            # 5. Image Results Display
             if image_upload:
-                st.write("### Image Analysis")
-                osint_data["metadata"] = get_image_metadata(image_upload)
-                osint_data["reverse_search_links"] = reverse_image_search_links(image_upload)
+                st.write("### Image Analysis Results")
+                if osint_data.get("metadata"):
+                    with st.expander("Technical Metadata"):
+                        st.json(osint_data["metadata"])
                 
-                if osint_data["metadata"] and isinstance(osint_data["metadata"], dict):
-                    # Try to find a name or info in metadata
-                    artist = osint_data["metadata"].get("Artist")
-                    author = osint_data["metadata"].get("Author")
-                    if artist: osint_data["names"].append(artist)
-                    if author: osint_data["names"].append(author)
-                
-                st.info("To find the identity, please use the reverse search links below. If you find a name, re-enter it in the search box.")
-                image_upload.seek(0)
+                st.info("To find the identity using visual search, please use the reverse search links below. Any text details found in image metadata have been added to the OSINT pipeline.")
 
             # 6. Analysis
             combined_text = f"{name_input} {email_input} {phone_input} " + " ".join(osint_data["names"])
@@ -488,7 +575,7 @@ def main():
             im1, im2 = st.columns(2)
             with im1:
                 if image_upload:
-                    st.image(image_upload, caption="Uploaded Image", use_column_width=True)
+                    st.image(image_upload, caption="Uploaded Image", use_container_width=True)
                 else:
                     st.write("No image uploaded.")
             with im2:
